@@ -70,6 +70,17 @@ jobs:
       - name: 赋予脚本执行权限
         run: chmod +x .code-safety-checker/scripts/*.sh
 
+      # ---- 2.1 安装 gitleaks（用于全历史敏感信息扫描）----
+      - name: 安装 gitleaks
+        run: |
+          if ! command -v gitleaks >/dev/null 2>&1; then
+            echo "→ 安装 gitleaks..."
+            VERSION=$(curl -sL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r '.tag_name')
+            curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" \
+              | sudo tar -xz -C /usr/local/bin gitleaks
+          fi
+          gitleaks version
+
       # ---- 3. 快速敏感信息扫描（diff 模式，秒级，先给个预警）----
       - name: 快速敏感信息扫描（Diff 模式）
         run: |

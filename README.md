@@ -205,6 +205,53 @@ jobs:
 
 ---
 
+### 方式二+：部署到 Gitee Go（合并请求强制检查）
+
+国内团队如使用 Gitee，可通过 Gitee Go 流水线实现等价的能力（合并请求自动检查 + 评论报告 + 流水线失败阻塞合并）。
+
+#### Step 1. 可选：把 checker 仓库导入到 Gitee（加速国内拉取）
+
+打开 **https://gitee.com/projects/import** → 填写 `https://github.com/jimGJW/code-safety-checker.git` → 导入后记下 Gitee 仓库地址（例如 `https://gitee.com/your-org/code-safety-checker.git`）。跳过此步则默认从 GitHub 拉取（国内网络可能较慢）。
+
+#### Step 2. 创建 Gitee 私人令牌
+
+打开 **https://gitee.com/profile/personal_access_tokens** → 生成新令牌，权限勾选：
+- `projects`、`pull_requests`、`notes`、`user_info`
+
+复制令牌字符串（下一步要用，只会显示一次）。
+
+#### Step 3. 在业务仓库添加流水线变量
+
+进入 **业务仓库 → 管理 → 流水线 → 流水线变量** → 新增：
+| 变量名 | 值 | 说明 |
+|--------|----|------|
+| `GITEE_TOKEN` | 上一步生成的私人令牌 | 用于 API 写评论、写 commit 状态 |
+
+#### Step 4. 在业务仓库添加流水线文件
+
+把本仓库的 **[.gitee/workflow/code-safety.yml](.gitee/workflow/code-safety.yml)** 复制到业务仓库的 `.workflow/code-safety.yml`，然后按注释调整 `CHECKER_REPO` / `STRICT` / `ONLY` / `SKIP`。
+
+或通过本仓库 Makefile 一键复制：
+```bash
+make gitee-install TARGET_DIR=/path/to/business-repo
+```
+
+然后 push 到 main/master。
+
+#### Step 5. 开启「必须通过流水线才能合并」
+
+进入 **业务仓库 → 设置 → 合并请求设置**（**https://gitee.com/<owner>/<repo>/settings#merge_request**）：
+- 勾选 **合并请求必须通过流水线才能合并**
+- 建议同时勾选 **合并请求必须通过测试**、**禁止直接推送代码到 master/main**
+
+#### 效果
+- 新建 / 更新合并请求时 Gitee Go 自动触发检查
+- 机器人会把「检查汇总 + 日志摘要」**评论到合并请求内**
+- 合并请求 commit 会显示 **code-safety-checker** 的状态徽标（pending/success/failure）
+- 失败则流水线失败，合并按钮被置灰禁用
+
+---
+
 ### 方式三：部署到 GitLab CI（MR 强制检查）
 
 #### Step 1. 将本 checker 推到 GitLab 项目

@@ -10,7 +10,7 @@ TARGET_DIR   ?= $(CURDIR)
 IMAGE_NAME   ?= code-safety-checker
 IMAGE_TAG    ?= latest
 
-.PHONY: help install-tools check check-full check-fast check-secret check-dep check-frontend check-backend check-iac check-license review install-hooks check-remote check-repos docker-build docker-run docker-push github-install gitlab-install self-test clean
+.PHONY: help install-tools check check-full check-fast check-secret check-dep check-frontend check-backend check-iac check-license review install-hooks check-remote check-repos docker-build docker-run docker-push github-install gitee-install gitlab-install self-test clean
 
 help: ## 显示帮助
 	@awk 'BEGIN {FS = ":.*##"; printf "\n使用: make \033[36m<命令>\033[0m [变量=值]\n\n命令:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } END { print "" }' $(MAKEFILE_LIST)
@@ -117,6 +117,16 @@ github-install: ## 一键复制 GitHub Actions 到当前目标仓库
 	cp .github/workflows/code-safety-check.yml "$(TARGET_DIR)/.github/workflows/"
 	@echo "✅ 已复制到 $(TARGET_DIR)/.github/workflows/code-safety-check.yml"
 	@echo "请编辑此文件顶部的 CHECKER_REPO / CHECKER_REF 变量"
+
+gitee-install: ## 一键复制 Gitee Go 流水线到当前目标仓库
+	@[ -d "$(TARGET_DIR)/.workflow" ] || mkdir -p "$(TARGET_DIR)/.workflow"
+	cp .gitee/workflow/code-safety.yml "$(TARGET_DIR)/.workflow/code-safety.yml"
+	@echo "✅ 已复制到 $(TARGET_DIR)/.workflow/code-safety.yml"
+	@echo "后续步骤:"
+	@echo "  1) 在 https://gitee.com/profile/personal_access_tokens 创建私人令牌 (projects + pull_requests + notes + user_info)"
+	@echo "  2) 仓库管理 → 流水线 → 流水线变量 添加 GITEE_TOKEN=<令牌>"
+	@echo "  3) 仓库设置 → 合并请求设置 → 勾选『合并请求必须通过流水线才能合并』"
+	@echo "  4) 编辑 .workflow/code-safety.yml 顶部 env.CHECKER_REPO 指向 checker 的 Gitee / GitHub 公开地址"
 
 gitlab-install: ## 一键复制 .gitlab-ci.yml include 模板到目标仓库
 	@cp .gitlab-ci.yml "$(TARGET_DIR)/.code-safety-checker.yml"

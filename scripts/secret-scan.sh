@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/utils.sh"
 
-SCAN_DIR="${1:-.}"
+SCAN_DIR="${SCAN_DIR:-${1:-.}}"
 SCAN_DEPTH="${SCAN_DEPTH:-0}"  # 0 = 全历史扫描
 REPORT_JSON="${REPORT_DIR}/secret-scan.json"
 REPORT_TXT="${REPORT_DIR}/secret-scan.txt"
@@ -54,19 +54,18 @@ builtin_regex_scan() {
 
   log_info "运行内置正则扫描引擎..."
 
-  # 直接写死关键模式（避免依赖 jq）
-  declare -A PATTERNS=(
-    ["AWS Access Key"]="AKIA[0-9A-Z]{16}"
-    ["GitHub PAT"]="gh[pousr]_[A-Za-z0-9]{36,}"
-    ["Private Key"]="-----BEGIN [A-Z ]*PRIVATE KEY-----"
-    ["Password Hardcoded"]="(?i)(password|passwd|pwd)\s*[:=]\s*['\"][^'\"]{6,}['\"]"
-    ["API Key Hardcoded"]="(?i)(api[_-]?key|apikey|secret[_-]?key)\s*[:=]\s*['\"][A-Za-z0-9_\-]{20,}['\"]"
-    ["DB Connection String"]="(?i)(mysql|postgres|mongodb|redis|mssql)://[A-Za-z0-9_\-]+:[A-Za-z0-9_\-]+@"
-    ["Bearer Token"]="Bearer\s+[A-Za-z0-9_\-=.]{20,}"
-    ["JWT Token"]="eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
-    ["Slack/Discord Webhook"]="https://hooks\.(slack|discord|teams|github)\.com/[A-Za-z0-9_\-/]+"
-    ["Google Service Account"]="\"type\"\s*:\s*\"service_account\""
-  )
+  # 直接写死关键模式（避免依赖 jq；并行数组兼容 bash 3.2）
+  declare -a PNAME PREG
+  PNAME[0]="AWS Access Key";          PREG[0]="AKIA[0-9A-Z]{16}"
+  PNAME[1]="GitHub PAT";              PREG[1]="gh[pousr]_[A-Za-z0-9]{36,}"
+  PNAME[2]="Private Key";             PREG[2]="-----BEGIN [A-Z ]*PRIVATE KEY-----"
+  PNAME[3]="Password Hardcoded";      PREG[3]="(?i)(password|passwd|pwd)\s*[:=]\s*['\"][^'\"]{6,}['\"]"
+  PNAME[4]="API Key Hardcoded";       PREG[4]="(?i)(api[_-]?key|apikey|secret[_-]?key)\s*[:=]\s*['\"][A-Za-z0-9_\-]{20,}['\"]"
+  PNAME[5]="DB Connection String";    PREG[5]="(?i)(mysql|postgres|mongodb|redis|mssql)://[A-Za-z0-9_\-]+:[A-Za-z0-9_\-]+@"
+  PNAME[6]="Bearer Token";            PREG[6]="Bearer\s+[A-Za-z0-9_\-=.]{20,}"
+  PNAME[7]="JWT Token";               PREG[7]="eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
+  PNAME[8]="Slack/Discord Webhook";   PREG[8]="https://hooks\.(slack|discord|teams|github)\.com/[A-Za-z0-9_\-/]+"
+  PNAME[9]="Google Service Account";  PREG[9]="\"type\"\s*:\s*\"service_account\""
 
   local exclude_dirs=(
     "node_modules" ".git" "dist" "build" "vendor"
@@ -82,24 +81,45 @@ builtin_regex_scan() {
     "*.md" "*.example" "*.sample" "*.template"
   )
 
-  for pattern_name in "${!PATTERNS[@]}"; do
-    local pattern="${PATTERNS[$pattern_name]}"
-    local exclude_args=()
-    for d in "${exclude_dirs[@]}"; do exclude_args+=("--exclude-dir=$d"); done
-    for f in "${exclude_files[@]}"; do exclude_args+=("--exclude=$f"); done
+  local exclude_args=()
+  for d in "${exclude_dirs[@]}"; do exclude_args+=("--exclude-dir=$d"); done
+  for f in "${exclude_files[@]}"; do exclude_args+=("--exclude=$f"); done
 
-    local hits
-    hits=$(grep -rInP "$pattern" "$SCAN_DIR" "${exclude_args[@]}" 2>/dev/null | head -50 || true)
-    if [[ -n "$hits" ]]; then
-      local count
-      count=$(echo "$hits" | wc -l | tr -d ' ')
-      log_warn "发现 ${count} 处疑似 [${pattern_name}]"
-      echo "=== ${pattern_name} (${count} 处) ===" >> "${tmp_output}"
-      echo "$hits" | head -20 >> "${tmp_output}"
-      echo "" >> "${tmp_output}"
-      result_count=$((result_count + count))
-    fi
+  # 批量扫描：把规则写入临时文件，用 pgrep.py --batch 一次遍历匹配所有规则
+  local rules_file batch_file
+  rules_file=$(mktemp)
+  batch_file=$(mktemp)
+  local _pi=0
+  while [[ $_pi -lt ${#PNAME[@]} ]]; do
+    printf '%s\t%s\n' "${PNAME[$_pi]}" "${PREG[$_pi]}" >> "$rules_file"
+    _pi=$((_pi + 1))
   done
+  grep_p_batch "$rules_file" "$SCAN_DIR" "${exclude_args[@]}" > "$batch_file" 2>/dev/null || true
+  rm -f "$rules_file"
+
+  # 逐条规则从 batch 结果中提取匹配行（IFS=tab 正确切分名称与内容，保留内容中的 tab）
+  _pi=0
+  while [[ $_pi -lt ${#PNAME[@]} ]]; do
+    local pattern_name="${PNAME[$_pi]}"
+    local cnt=0
+    local out=""
+    local name rest
+    while IFS=$'\t' read -r name rest; do
+      [[ -z "$name" ]] && continue
+      [[ "$name" == "$pattern_name" ]] || continue
+      cnt=$((cnt + 1))
+      [[ $cnt -le 20 ]] && out="${out}${rest}"$'\n'
+    done < "$batch_file"
+    if [[ $cnt -gt 0 ]]; then
+      log_warn "发现 ${cnt} 处疑似 [${pattern_name}]"
+      echo "=== ${pattern_name} (${cnt} 处) ===" >> "${tmp_output}"
+      printf '%s' "$out" >> "${tmp_output}"
+      echo "" >> "${tmp_output}"
+      result_count=$((result_count + cnt))
+    fi
+    _pi=$((_pi + 1))
+  done
+  rm -f "$batch_file"
 
   # 输出到报告
   if [[ -s "${tmp_output}" ]]; then
@@ -133,7 +153,7 @@ run_secret_scan() {
     if command_exists jq; then
       gitleaks_findings=$(jq 'length' "${REPORT_JSON}" 2>/dev/null || echo 0)
     else
-      gitleaks_findings=$(grep -c '"RuleID"' "${REPORT_JSON}" 2>/dev/null || echo 0)
+      gitleaks_findings=$(grep -c '"RuleID"' "${REPORT_JSON}" 2>/dev/null || true)
     fi
   fi
   log_info "gitleaks 发现 ${gitleaks_findings} 处问题"

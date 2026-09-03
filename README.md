@@ -31,9 +31,12 @@ code-safety-checker/
 ├── .gitlab-ci.yml                # GitLab CI 模板（可作为 include 模板复用）
 ├── config/
 │   ├── check-config.json         # 检查器配置：开关、严重度阈值、规则
-│   └── secret-patterns.json      # 敏感信息自定义正则 + 白名单
+│   ├── secret-patterns.json      # 敏感信息自定义正则 + 白名单
+│   └── repos.json                # 批量检查的远程仓库清单（check-repos.sh 读取）
 ├── scripts/
 │   ├── run-checks.sh             # ⭐ 主入口 (所有入口最终都走这里)
+│   ├── check-remote.sh           # ⭐ 远程 GitHub 仓库一键检查（clone+检查+生成报告文档）
+│   ├── check-repos.sh            # ⭐ 批量检查 config/repos.json 中所有远程仓库
 │   ├── utils.sh                  # 日志/颜色/统计/报告生成
 │   ├── secret-scan.sh            # 敏感信息扫描
 │   ├── dependency-scan.sh        # 依赖漏洞扫描
@@ -41,7 +44,7 @@ code-safety-checker/
 │   ├── backend-check.sh          # 后端安全 + 可靠性
 │   ├── iac-container-check.sh    # IaC / Dockerfile / 容器镜像
 │   └── license-check.sh          # 许可证合规
-└── reports/                      # 运行时产出的报告目录
+└── reports/                      # 运行时产出的报告目录（每个被检仓库一个子目录）
 ```
 
 ---
@@ -109,6 +112,47 @@ make install-hooks TARGET_DIR=/path/to/your-repo
 ```
 
 安装后，任何 git 客户端每次 `commit` 都会自动扫描暂存文件，命中 critical/high 密钥时阻止提交并打印审查结论；`git commit --no-verify` 或 `SKIP_SAFETY=1 git commit` 可临时强制跳过。
+
+---
+
+### 方式一·补充 2：直接检查远程 GitHub 仓库（一键出报告文档）
+
+不想把 checker 装进目标仓库？只要给一个 GitHub 仓库地址，本工具会自动 clone → 全量检查 → 生成独立 Markdown 检查文档。**支持 HTTPS 与 SSH 两种地址**。
+
+```bash
+# 单个仓库一键检查（最常用）
+./scripts/check-remote.sh https://github.com/owner/repo.git
+./scripts/check-remote.sh git@github.com:owner/repo.git --strict
+
+# 指定分支 / 只跑部分检查 / 浅克隆深度
+./scripts/check-remote.sh git@github.com:owner/repo.git --branch dev --only secret,dep
+./scripts/check-remote.sh https://github.com/owner/repo.git --depth 0   # 0=全量历史（敏感信息扫描更彻底）
+
+# 等价 Makefile 用法
+make check-remote REPO_URL=git@github.com:owner/repo.git STRICT=true
+```
+
+**产出**：`reports/<仓库名>/<时间戳>-report.md`（同时更新 `latest-report.md` 指向最新一次），包含总体结论、仓库与提交信息、检查汇总统计表、各检查项明细、完整原始输出，以及 `reports/<仓库名>/` 下各检查项的原始产物文件。
+
+#### 批量检查多个仓库（清单驱动）
+
+把要巡检的仓库地址写进 [config/repos.json](config/repos.json)（每条可单独配置 `branch`/`strict`/`only`/`skip`/`enabled`），然后一条命令全部检查并生成总览：
+
+```bash
+# 检查 repos.json 中所有 enabled=true 的仓库
+./scripts/check-repos.sh
+
+# 对所有仓库只跑敏感信息 + 依赖；或只检查名称匹配的仓库
+./scripts/check-repos.sh --only secret,dep
+./scripts/check-repos.sh --filter code-safety
+
+# 等价 Makefile 用法
+make check-repos STRICT=true
+```
+
+**产出**：每个仓库一份 `reports/<仓库名>/latest-report.md`，外加 `reports/index.md` 总览表格（列出每个仓库的通过/失败、退出码与报告链接）。任一仓库失败则整体退出码非 0，便于接入定时巡检 / 定时任务。
+
+> 💡 `repos.json` 里把 `"enabled"` 设为 `false` 可临时跳过某仓库而无需删除条目；`check-repos.sh --filter <关键字>` 可只检查名称匹配的仓库。
 
 ---
 

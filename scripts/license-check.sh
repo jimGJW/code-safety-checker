@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/utils.sh"
 
-SCAN_DIR="${1:-.}"
+SCAN_DIR="${SCAN_DIR:-${1:-.}}"
 
 DEFAULT_BLOCKLIST=("GPL-1.0" "GPL-2.0" "GPL-3.0" "AGPL-1.0" "AGPL-3.0" "SSPL-1.0" "SSPL" "BUSL-1.1")
 DEFAULT_ALLOWLIST=(

@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/utils.sh"
 
-SCAN_DIR="${1:-.}"
+SCAN_DIR="${SCAN_DIR:-${1:-.}}"
 REPORT_DIR="${REPORT_DIR:-${CHECKER_ROOT}/reports}"
 
 scan_npm_deps() {

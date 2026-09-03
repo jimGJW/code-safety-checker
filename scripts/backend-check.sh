@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/utils.sh"
 
-SCAN_DIR="${1:-.}"
+SCAN_DIR="${SCAN_DIR:-${1:-.}}"
 REPORT_TXT="${REPORT_DIR}/backend-check.txt"
 
 PROJECT_TYPES=""
@@ -23,17 +23,23 @@ detect_backend_stacks() {
 find_backend_files() {
   # 按不同语言返回相应文件列表
   local patterns=()
-  for t in "${PROJECT_TYPES[@]:-backend-nodejs backend-python backend-golang}"; do
-    case "$t" in
-      *nodejs*) patterns+=("*.js" "*.ts") ;;
-      *python*) patterns+=("*.py") ;;
-      *golang*) patterns+=("*.go") ;;
-      *java*)   patterns+=("*.java") ;;
-      *ruby*)   patterns+=("*.rb") ;;
-      *rust*)   patterns+=("*.rs") ;;
-      *php*)    patterns+=("*.php") ;;
-    esac
-  done
+  local t
+  if [[ ${#PROJECT_TYPES[@]} -eq 0 ]]; then
+    # 未识别具体栈：通用扫描所有主流后端扩展
+    patterns=("*.js" "*.ts" "*.py" "*.go" "*.java" "*.rb" "*.rs" "*.php")
+  else
+    for t in "${PROJECT_TYPES[@]}"; do
+      case "$t" in
+        *nodejs*) patterns+=("*.js" "*.ts") ;;
+        *python*) patterns+=("*.py") ;;
+        *golang*) patterns+=("*.go") ;;
+        *java*)   patterns+=("*.java") ;;
+        *ruby*)   patterns+=("*.rb") ;;
+        *rust*)   patterns+=("*.rs") ;;
+        *php*)    patterns+=("*.php") ;;
+      esac
+    done
+  fi
 
   local find_args=()
   for p in "${patterns[@]}"; do find_args+=("-name" "$p" "-o"); done
@@ -96,7 +102,10 @@ run_builtin_backend_rules() {
   # 内置通用后端安全规则（零依赖 grep 实现）
   local issues=0
   declare -a backend_files
-  mapfile -t backend_files < <(find_backend_files)
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    backend_files+=("$f")
+  done < <(find_backend_files)
   local total_files="${#backend_files[@]}"
   log_info "扫描后端源文件: ${total_files} 个"
 
@@ -107,51 +116,66 @@ run_builtin_backend_rules() {
 
   : > "${REPORT_TXT}.rules.tmp"
 
-  # 通用安全规则（跨语言）
-  declare -A RULES=(
-    ["SQL注入: 字符串拼接 SQL"]="(SELECT|INSERT|UPDATE|DELETE|DROP|UNION)[^;]*\$[{(]?[a-zA-Z_][a-zA-Z0-9_]*[})]?|(SELECT|INSERT|UPDATE)[^;]*\+\s*(req|params|args|input|query|body|form|user)"
-    ["SQL注入: format/f-string 拼接 SQL"]="(%s.*SQL|f[\"'][^\"']*(SELECT|INSERT|UPDATE)|sql\s*=\s*format\()"
-    ["命令注入: exec/system/spawn 拼接用户输入"]="(exec|execSync|system|spawn|popen|subprocess\.call|subprocess\.Popen|Runtime\.getRuntime\(\)\.exec|os\.Exec)\s*\([^)]*(req\.|params\.|args\[|input|form|body\.|query\.|request\.|user)"
-    ["命令注入: 反引号/shell=True"]="shell\s*=\s*True|\$\([^)]*\+"
-    ["路径穿越: 直接拼接路径读取文件"]="(readFileSync|readFile|fs\.readFile|open\(|File\(|Path\.join|os\.path\.join)\s*\([^)]*(req\.|params\.|query\.|body\.|form|request)"
-    ["SSRF: 可控 URL 的 HTTP 请求"]="(axios|fetch|request|http\.get|requests\.(get|post)|urllib\.|http\.Client)\s*\([^)]*(req\.|params\.|query\.|body\.|input|user)"
-    ["XXE: 允许外部实体的 XML 解析"]="(DocumentBuilderFactory|SAXParserFactory|XMLInputFactory|DOMParser)[^;]*setFeature[^;]*false|lxml.*no_network.*False|etree\.XML\("
-    ["反序列化: pickle/yaml/ObjectInputStream 不可信数据"]="(pickle\.loads|yaml\.load\s*\(|ObjectInputStream\.readObject|marshal\.load|JSON\.parse.*untrusted)"
-    ["不安全加密: MD5/SHA1/ECB/RSA 无填充"]="(md5|sha1|createHash\(['\"]md5|createHash\(['\"]sha1|AES-?ECB|DES|CBC.*NoPadding)"
-    ["弱随机数: 用于安全场景"]="(Math\.random|random\.random\(\)|rand\.Intn|crypto/rand\s+\"math/rand\")"
-    ["硬编码密钥/密码"]="(api[_-]?key|secret|password|passwd|token)\s*[:=]\s*['\"][A-Za-z0-9_\-]{12,}['\"]"
-    ["敏感信息: print/log 泄露"]="(console\.log|print\(|log\.(info|debug|warn))\s*\([^)]*(password|secret|token|jwt|api[_-]?key)"
-    ["CORS 配置过于宽松"]="Access-Control-Allow-Origin['\"]?\s*[:=]\s*['\"]\*['\"]"
-    ["重定向: 可控跳转"]="(redirect|location\.href|Location:\s*|window\.location\s*=)\s*\(?\s*['\"]?(req\.|params\.|query\.|input|body\.)"
-    ["认证绕过: 密码用 == 比较"]="if\s*\([^)]*password[^)]*==|if\s+[^:]*password.*==\s*['\"]"
-    ["并发可靠性: 空 db/conn 未判断就使用"]="->(query|execute|Exec|QueryRow)\s*\(\s*\)|\.db\s*->|\.cursor\s*->.*(execute|fetch)"
-    ["资源泄露: 缺少 defer/close 模式"]="(open\(|createReadStream|createConnection|connect\(\))[^;\n]{0,200}(?!.*(close\(\)|defer\s|finally\s*\{|\.end\(\)))$"
-  )
+  # 通用安全规则（跨语言）——bash 3.2 兼容：并行数组存规则名与正则
+  declare -a RULE_NAME RULE_PATTERN
+  local ri=0
+  _add_rule() { RULE_NAME[$ri]="$1"; RULE_PATTERN[$ri]="$2"; ri=$((ri + 1)); }
+  _add_rule "SQL注入: 字符串拼接 SQL" "(SELECT|INSERT|UPDATE|DELETE|DROP|UNION)[^;]*\$[{(]?[a-zA-Z_][a-zA-Z0-9_]*[})]?|(SELECT|INSERT|UPDATE)[^;]*\+\s*(req|params|args|input|query|body|form|user)"
+  _add_rule "SQL注入: format/f-string 拼接 SQL" "(%s.*SQL|f[\"'][^\"']*(SELECT|INSERT|UPDATE)|sql\s*=\s*format\()"
+  _add_rule "命令注入: exec/system/spawn 拼接用户输入" "(exec|execSync|system|spawn|popen|subprocess\.call|subprocess\.Popen|Runtime\.getRuntime\(\)\.exec|os\.Exec)\s*\([^)]*(req\.|params\.|args\[|input|form|body\.|query\.|request\.|user)"
+  _add_rule "命令注入: 反引号/shell=True" "shell\s*=\s*True|\$\([^)]*\+"
+  _add_rule "路径穿越: 直接拼接路径读取文件" "(readFileSync|readFile|fs\.readFile|open\(|File\(|Path\.join|os\.path\.join)\s*\([^)]*(req\.|params\.|query\.|body\.|form|request)"
+  _add_rule "SSRF: 可控 URL 的 HTTP 请求" "(axios|fetch|request|http\.get|requests\.(get|post)|urllib\.|http\.Client)\s*\([^)]*(req\.|params\.|query\.|body\.|input|user)"
+  _add_rule "XXE: 允许外部实体的 XML 解析" "(DocumentBuilderFactory|SAXParserFactory|XMLInputFactory|DOMParser)[^;]*setFeature[^;]*false|lxml.*no_network.*False|etree\.XML\("
+  _add_rule "反序列化: pickle/yaml/ObjectInputStream 不可信数据" "(pickle\.loads|yaml\.load\s*\(|ObjectInputStream\.readObject|marshal\.load|JSON\.parse.*untrusted)"
+  _add_rule "不安全加密: MD5/SHA1/ECB/RSA 无填充" "(md5|sha1|createHash\(['\"]md5|createHash\(['\"]sha1|AES-?ECB|DES|CBC.*NoPadding)"
+  _add_rule "弱随机数: 用于安全场景" "(Math\.random|random\.random\(\)|rand\.Intn|crypto/rand\s+\"math/rand\")"
+  _add_rule "硬编码密钥/密码" "(api[_-]?key|secret|password|passwd|token)\s*[:=]\s*['\"][A-Za-z0-9_\-]{12,}['\"]"
+  _add_rule "敏感信息: print/log 泄露" "(console\.log|print\(|log\.(info|debug|warn))\s*\([^)]*(password|secret|token|jwt|api[_-]?key)"
+  _add_rule "CORS 配置过于宽松" "Access-Control-Allow-Origin['\"]?\s*[:=]\s*['\"]\*['\"]"
+  _add_rule "重定向: 可控跳转" "(redirect|location\.href|Location:\s*|window\.location\s*=)\s*\(?\s*['\"]?(req\.|params\.|query\.|input|body\.)"
+  _add_rule "认证绕过: 密码用 == 比较" "if\s*\([^)]*password[^)]*==|if\s+[^:]*password.*==\s*['\"]"
+  _add_rule "并发可靠性: 空 db/conn 未判断就使用" "->(query|execute|Exec|QueryRow)\s*\(\s*\)|\.db\s*->|\.cursor\s*->.*(execute|fetch)"
+  _add_rule "资源泄露: 缺少 defer/close 模式" "(open\(|createReadStream|createConnection|connect\(\))[^;\n]{0,200}(?!.*(close\(\)|defer\s|finally\s*\{|\.end\(\)))$"
+  unset -f _add_rule
 
-  local files_list_file
-  files_list_file=$(mktemp)
-  printf "%s\n" "${backend_files[@]}" > "$files_list_file"
-
-  for rule_name in "${!RULES[@]}"; do
-    local pattern="${RULES[$rule_name]}"
-    local hits=""
-    # 对文件列表逐一 grep
-    if command_exists xargs; then
-      hits=$(xargs grep -InHP "$pattern" < "$files_list_file" 2>/dev/null | head -50 || true)
-    fi
-    if [[ -z "$hits" && "$total_files" -lt 2000 ]]; then
-      hits=$(grep -InHP "$pattern" "${backend_files[@]}" 2>/dev/null | head -50 || true)
-    fi
-    if [[ -n "$hits" ]]; then
-      local count
-      count=$(echo "$hits" | wc -l | tr -d ' ')
-      echo "【${rule_name}】发现 ${count} 处:" >> "${REPORT_TXT}.rules.tmp"
-      echo "$hits" | head -30 >> "${REPORT_TXT}.rules.tmp"
-      echo "" >> "${REPORT_TXT}.rules.tmp"
-      issues=$((issues + count))
-    fi
+  # 批量扫描：规则写入临时文件，pgrep.py --batch 一次遍历匹配所有规则
+  local rules_file batch_file
+  rules_file=$(mktemp)
+  batch_file=$(mktemp)
+  ri=0
+  while [[ $ri -lt ${#RULE_NAME[@]} ]]; do
+    printf '%s\t%s\n' "${RULE_NAME[$ri]}" "${RULE_PATTERN[$ri]}" >> "$rules_file"
+    ri=$((ri + 1))
   done
-  rm -f "$files_list_file"
+  if [[ $total_files -lt 2000 ]]; then
+    grep_p_batch "$rules_file" "${backend_files[@]}" > "$batch_file" 2>/dev/null || true
+  else
+    grep_p_batch "$rules_file" "$SCAN_DIR" > "$batch_file" 2>/dev/null || true
+  fi
+  rm -f "$rules_file"
+
+  ri=0
+  while [[ $ri -lt ${#RULE_NAME[@]} ]]; do
+    local rule_name="${RULE_NAME[$ri]}"
+    local cnt=0
+    local out=""
+    local name rest
+    while IFS=$'\t' read -r name rest; do
+      [[ -z "$name" ]] && continue
+      [[ "$name" == "$rule_name" ]] || continue
+      cnt=$((cnt + 1))
+      [[ $cnt -le 30 ]] && out="${out}${rest}"$'\n'
+    done < "$batch_file"
+    if [[ $cnt -gt 0 ]]; then
+      echo "【${rule_name}】发现 ${cnt} 处:" >> "${REPORT_TXT}.rules.tmp"
+      printf '%s' "$out" >> "${REPORT_TXT}.rules.tmp"
+      echo "" >> "${REPORT_TXT}.rules.tmp"
+      issues=$((issues + cnt))
+    fi
+    ri=$((ri + 1))
+  done
+  rm -f "$batch_file"
 
   if [[ -s "${REPORT_TXT}.rules.tmp" ]]; then
     cat "${REPORT_TXT}.rules.tmp" > "${REPORT_TXT}"
@@ -214,7 +238,7 @@ check_backend_reliability() {
   # 5. 硬编码配置: 端口/超时等
   local hardcoded
   hardcoded=$(grep -rnE "(listen|port|timeout|dial)\s*[:=]\s*[0-9]+" "${SCAN_DIR}" --include="*.py" --include="*.go" --include="*.js" --include="*.ts" --include="*.java" 2>/dev/null \
-    | grep -vE "(\.test\.|\.spec\.|/test/|/tests/|const\s+.*[Tt]imeout|timeout_ms|timeout_seconds|default:" | wc -l | tr -d ' ')
+    | grep -vE "(\.test\.|\.spec\.|/test/|/tests/|const\s+.*[Tt]imeout|timeout_ms|timeout_seconds|default:)" | wc -l | tr -d ' ')
   log_info "硬编码端口/超时配置: ${hardcoded} 处（建议使用 config/env 集中管理）"
 
   echo "$issues"

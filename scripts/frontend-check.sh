@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/utils.sh"
 
-SCAN_DIR="${1:-.}"
+SCAN_DIR="${SCAN_DIR:-${1:-.}}"
 REPORT_TXT="${REPORT_DIR}/frontend-check.txt"
 
 # 前端源码典型目录
@@ -38,8 +38,10 @@ find_frontend_files() {
       ! -path "*/coverage/*" \
       ! -name "*.min.js" -print0 2>/dev/null)
   done
-  # 去重 & 输出
-  printf "%s\n" "${result[@]}" | sort -u
+  # 去重 & 输出（空数组时避免 set -u 报错）
+  if [[ ${#result[@]} -gt 0 ]]; then
+    printf "%s\n" "${result[@]}" | sort -u
+  fi
 }
 
 run_eslint() {
@@ -100,7 +102,10 @@ run_builtin_frontend_rules() {
   # 内置前端安全规则（grep 实现，零依赖）
   local issues=0
   declare -a frontend_files
-  mapfile -t frontend_files < <(find_frontend_files)
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    frontend_files+=("$f")
+  done < <(find_frontend_files)
   local total_files="${#frontend_files[@]}"
   log_info "扫描前端源文件: ${total_files} 个"
 
@@ -111,46 +116,60 @@ run_builtin_frontend_rules() {
 
   : > "${REPORT_TXT}.rules.tmp"
 
-  declare -A RULES=(
-    ["XSS: 危险的 innerHTML/outerHTML 赋值"]="\.(innerHTML|outerHTML)\s*="
-    ["XSS: document.write 注入"]="document\.write\s*\("
-    ["XSS: React dangerouslySetInnerHTML"]="dangerouslySetInnerHTML"
-    ["XSS: Vue v-html 指令"]="v-html\s*="
-    ["代码注入: eval() 调用"]="eval\s*\("
-    ["代码注入: new Function()"]="new\s+Function\s*\("
-    ["代码注入: setTimeout/setInterval 字符串形式"]="set(Timeout|Interval)\s*\(\s*['\"]"
-    ["代码注入: setTimeout/setInterval 字符串形式"]="set(Timeout|Interval)\s*\(\s*`"
-    ["DOM 型 XSS: location.hash 未过滤直接使用"]="location\.hash[^;]*innerHTML|location\.hash[^;]*\.replace\(|location\.hash[^;]*eval"
-    ["敏感数据: localStorage/sessionStorage 存明文密码/JWT"]="(localStorage|sessionStorage)\.setItem\([^)]*(password|token|jwt|secret)"
-    ["不安全跳转: 直接使用用户可控 URL"]="window\.location\s*=\s*(req\.|params\.|query\.|props\.|userInput|location\.search)"
-    ["硬编码密钥模式"]="(api[_-]?key|apikey|secret|access[_-]?token|private[_-]?key)\s*[:=]\s*['\"][A-Za-z0-9_\-]{15,}['\"]"
-    ["CSP: 允许 unsafe-eval/unsafe-inline (meta 标签)"]="Content-Security-Policy[^>]*unsafe-(eval|inline)"
-    ["SQL 拼接: 前端直接构造 SQL"]="SELECT\s+.*\$\{|INSERT\s+.*\$\{|UPDATE\s+.*\$\{"
-    ["命令注入: Nodejs child_process.exec 用户输入拼接"]="exec(FileSync)?\s*\(\s*`.*\$\{|exec\s*\(\s*['\"][^'\"]*\$\{"
-  )
+  # bash 3.2 兼容：并行数组存规则名与正则
+  declare -a RULE_NAME RULE_PATTERN
+  local ri=0
+  _add_rule() { RULE_NAME[$ri]="$1"; RULE_PATTERN[$ri]="$2"; ri=$((ri + 1)); }
+  _add_rule "XSS: 危险的 innerHTML/outerHTML 赋值" "\.(innerHTML|outerHTML)\s*="
+  _add_rule "XSS: document.write 注入" "document\.write\s*\("
+  _add_rule "XSS: React dangerouslySetInnerHTML" "dangerouslySetInnerHTML"
+  _add_rule "XSS: Vue v-html 指令" "v-html\s*="
+  _add_rule "代码注入: eval() 调用" "eval\s*\("
+  _add_rule "代码注入: new Function()" "new\s+Function\s*\("
+  _add_rule "代码注入: setTimeout/setInterval 字符串形式" "set(Timeout|Interval)\s*\(\s*['\"]"
+  _add_rule "代码注入: setTimeout/setInterval 字符串形式(反引号)" "set(Timeout|Interval)\s*\(\s*`"
+  _add_rule "DOM 型 XSS: location.hash 未过滤直接使用" "location\.hash[^;]*innerHTML|location\.hash[^;]*\.replace\(|location\.hash[^;]*eval"
+  _add_rule "敏感数据: localStorage/sessionStorage 存明文密码/JWT" "(localStorage|sessionStorage)\.setItem\([^)]*(password|token|jwt|secret)"
+  _add_rule "不安全跳转: 直接使用用户可控 URL" "window\.location\s*=\s*(req\.|params\.|query\.|props\.|userInput|location\.search)"
+  _add_rule "硬编码密钥模式" "(api[_-]?key|apikey|secret|access[_-]?token|private[_-]?key)\s*[:=]\s*['\"][A-Za-z0-9_\-]{15,}['\"]"
+  _add_rule "CSP: 允许 unsafe-eval/unsafe-inline (meta 标签)" "Content-Security-Policy[^>]*unsafe-(eval|inline)"
+  _add_rule "SQL 拼接: 前端直接构造 SQL" "SELECT\s+.*\$\{|INSERT\s+.*\$\{|UPDATE\s+.*\$\{"
+  _add_rule "命令注入: Nodejs child_process.exec 用户输入拼接" "exec(FileSync)?\s*\(\s*`.*\$\{|exec\s*\(\s*['\"][^'\"]*\$\{"
+  unset -f _add_rule
 
-  local files_list_file
-  files_list_file=$(mktemp)
-  printf "%s\n" "${frontend_files[@]}" > "$files_list_file"
-
-  for rule_name in "${!RULES[@]}"; do
-    local pattern="${RULES[$rule_name]}"
-    local hits
-    hits=$(grep -InHP "$pattern" -f <(cat "$files_list_file") "${SCAN_DIR}" 2>/dev/null | head -50 || true)
-    # 兼容无 xargs -f 的系统，改用 xargs
-    if [[ -z "$hits" ]]; then
-      hits=$(xargs grep -InHP "$pattern" < "$files_list_file" 2>/dev/null | head -50 || true)
-    fi
-    if [[ -n "$hits" ]]; then
-      local count
-      count=$(echo "$hits" | wc -l | tr -d ' ')
-      echo "【${rule_name}】发现 ${count} 处:" >> "${REPORT_TXT}.rules.tmp"
-      echo "$hits" >> "${REPORT_TXT}.rules.tmp"
-      echo "" >> "${REPORT_TXT}.rules.tmp"
-      issues=$((issues + count))
-    fi
+  # 批量扫描：规则写入临时文件，pgrep.py --batch 一次遍历匹配所有规则
+  local rules_file batch_file
+  rules_file=$(mktemp)
+  batch_file=$(mktemp)
+  ri=0
+  while [[ $ri -lt ${#RULE_NAME[@]} ]]; do
+    printf '%s\t%s\n' "${RULE_NAME[$ri]}" "${RULE_PATTERN[$ri]}" >> "$rules_file"
+    ri=$((ri + 1))
   done
-  rm -f "$files_list_file"
+  grep_p_batch "$rules_file" "${frontend_files[@]}" > "$batch_file" 2>/dev/null || true
+  rm -f "$rules_file"
+
+  ri=0
+  while [[ $ri -lt ${#RULE_NAME[@]} ]]; do
+    local rule_name="${RULE_NAME[$ri]}"
+    local cnt=0
+    local out=""
+    local name rest
+    while IFS=$'\t' read -r name rest; do
+      [[ -z "$name" ]] && continue
+      [[ "$name" == "$rule_name" ]] || continue
+      cnt=$((cnt + 1))
+      out="${out}${rest}"$'\n'
+    done < "$batch_file"
+    if [[ $cnt -gt 0 ]]; then
+      echo "【${rule_name}】发现 ${cnt} 处:" >> "${REPORT_TXT}.rules.tmp"
+      printf '%s' "$out" >> "${REPORT_TXT}.rules.tmp"
+      echo "" >> "${REPORT_TXT}.rules.tmp"
+      issues=$((issues + cnt))
+    fi
+    ri=$((ri + 1))
+  done
+  rm -f "$batch_file"
 
   if [[ -s "${REPORT_TXT}.rules.tmp" ]]; then
     cat "${REPORT_TXT}.rules.tmp" > "${REPORT_TXT}"
@@ -165,7 +184,10 @@ check_frontend_reliability() {
   local issues=0
   local warn_only=0
   declare -a frontend_files
-  mapfile -t frontend_files < <(find_frontend_files)
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    frontend_files+=("$f")
+  done < <(find_frontend_files)
 
   log_section "前端可靠性 / 代码质量检查"
 

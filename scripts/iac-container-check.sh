@@ -8,10 +8,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/utils.sh"
 
-SCAN_DIR="${1:-.}"
+SCAN_DIR="${SCAN_DIR:-${1:-.}}"
 REPORT_DIR="${REPORT_DIR:-${CHECKER_ROOT}/reports}"
 
-declare -A SEVERITY_COUNTS=( ["HIGH"]=0 ["CRITICAL"]=0 ["MEDIUM"]=0 )
+# bash 3.2 兼容：用独立计数器替代关联数组
+SEV_HIGH=0
+SEV_CRITICAL=0
+SEV_MEDIUM=0
 
 # ---- Dockerfile 最佳实践检查 (内置零依赖) ----
 check_dockerfile_builtin() {
@@ -53,7 +56,7 @@ check_dockerfile_builtin() {
 
     # 4. 暴露过多端口
     local expose_count
-    expose_count=$(grep -cE '^EXPOSE' "$df" || echo 0)
+    expose_count=$(grep -cE '^EXPOSE' "$df" 2>/dev/null || true)
     if [[ $expose_count -gt 5 ]]; then
       echo "$df: EXPOSE 端口过多 (${expose_count})，请确认是否都需要" >> "${REPORT_DIR}/dockerfile-check.txt"
       issues=$((issues + 1))
@@ -62,7 +65,7 @@ check_dockerfile_builtin() {
     # 5. 在 Dockerfile 中写入密钥
     if grep -qiE '(secret|password|token|api[_-]?key|ssh_prv_key).*=|ARG.*(SECRET|PASSWORD|TOKEN|KEY)' "$df"; then
       echo "$df: 疑似 Dockerfile 中硬编码/传递密钥 (请使用 BuildKit secrets / 环境变量)" >> "${REPORT_DIR}/dockerfile-check.txt"
-      SEVERITY_COUNTS["HIGH"]=$((SEVERITY_COUNTS["HIGH"] + 1))
+      SEV_HIGH=$((SEV_HIGH + 1))
       issues=$((issues + 1))
     fi
 
@@ -79,7 +82,7 @@ check_dockerfile_builtin() {
     fi
   done
 
-  echo "${issues}|${SEVERITY_COUNTS["HIGH"]}"
+  echo "${issues}|${SEV_HIGH}"
 }
 
 # ---- Terraform / K8s / Helm 内置规则 ----
@@ -100,7 +103,7 @@ check_iac_builtin() {
       c=$(echo "$hits" | wc -l | tr -d ' ')
       echo "Terraform: 发现 ${c} 处 Security Group 开放 0.0.0.0/0" >> "${REPORT_DIR}/iac-check.txt"
       echo "$hits" >> "${REPORT_DIR}/iac-check.txt"
-      SEVERITY_COUNTS["HIGH"]=$((SEVERITY_COUNTS["HIGH"] + c))
+      SEV_HIGH=$((SEV_HIGH + c))
       issues=$((issues + c))
     fi
     # S3 未加密 / public
@@ -132,7 +135,7 @@ check_iac_builtin() {
       local c
       c=$(echo "$hits" | wc -l | tr -d ' ')
       echo "K8s: 发现 ${c} 处 privileged: true (高危)" >> "${REPORT_DIR}/iac-check.txt"
-      SEVERITY_COUNTS["CRITICAL"]=$((SEVERITY_COUNTS["CRITICAL"] + c))
+      SEV_CRITICAL=$((SEV_CRITICAL + c))
       issues=$((issues + c))
     fi
 
@@ -141,7 +144,7 @@ check_iac_builtin() {
     [[ -n "$hits" ]] && {
       local c; c=$(echo "$hits" | wc -l | tr -d ' ')
       echo "K8s: ${c} 处允许以 root 运行" >> "${REPORT_DIR}/iac-check.txt"
-      SEVERITY_COUNTS["HIGH"]=$((SEVERITY_COUNTS["HIGH"] + c))
+      SEV_HIGH=$((SEV_HIGH + c))
       issues=$((issues + c))
     }
 
@@ -202,11 +205,11 @@ scan_container_image() {
     trivy image --exit-code 0 --severity HIGH,CRITICAL --format json \
       -o "${REPORT_DIR}/trivy-image.json" --no-progress "$image" 2>/dev/null || true
     if command_exists jq && [[ -s "${REPORT_DIR}/trivy-image.json" ]]; then
-      SEVERITY_COUNTS["HIGH"]=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "${REPORT_DIR}/trivy-image.json" 2>/dev/null || echo 0)
-      SEVERITY_COUNTS["CRITICAL"]=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "${REPORT_DIR}/trivy-image.json" 2>/dev/null || echo 0)
-      issues=$((SEVERITY_COUNTS["HIGH"] + SEVERITY_COUNTS["CRITICAL"]))
+      SEV_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "${REPORT_DIR}/trivy-image.json" 2>/dev/null || echo 0)
+      SEV_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "${REPORT_DIR}/trivy-image.json" 2>/dev/null || echo 0)
+      issues=$((SEV_HIGH + SEV_CRITICAL))
     fi
-    log_info "Trivy: HIGH=${SEVERITY_COUNTS["HIGH"]}, CRITICAL=${SEVERITY_COUNTS["CRITICAL"]}"
+    log_info "Trivy: HIGH=${SEV_HIGH}, CRITICAL=${SEV_CRITICAL}"
   elif command_exists docker; then
     log_info "尝试通过 Docker 运行 aquasec/trivy..."
     docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
@@ -216,7 +219,7 @@ scan_container_image() {
   else
     log_warn "Trivy 未安装且无 Docker，跳过镜像扫描 (https://github.com/aquasecurity/trivy)"
   fi
-  echo "${issues}|${SEVERITY_COUNTS["CRITICAL"]}"
+  echo "${issues}|${SEV_CRITICAL}"
 }
 
 run_iac_container_check() {
@@ -235,10 +238,10 @@ run_iac_container_check() {
 
   log_info "汇总: Dockerfile=${docker_issues}, IaC=${iac_issues}, 镜像=${image_issues} (critical=${critical})"
 
-  if [[ ${SEVERITY_COUNTS["CRITICAL"]} -gt 0 ]]; then
-    record_result "IaC/容器检查" "failed" "critical" "$total" "Critical=${SEVERITY_COUNTS["CRITICAL"]}, High=${SEVERITY_COUNTS["HIGH"]}"
+  if [[ ${SEV_CRITICAL} -gt 0 ]]; then
+    record_result "IaC/容器检查" "failed" "critical" "$total" "Critical=${SEV_CRITICAL}, High=${SEV_HIGH}"
   elif [[ $total -gt 0 ]]; then
-    record_result "IaC/容器检查" "failed" "medium" "$total" "High=${SEVERITY_COUNTS["HIGH"]}"
+    record_result "IaC/容器检查" "failed" "medium" "$total" "High=${SEV_HIGH}"
   else
     record_result "IaC/容器检查" "passed" "none" 0
   fi

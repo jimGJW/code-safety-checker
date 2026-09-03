@@ -4,17 +4,6 @@
 # 串联执行所有检查模块，输出报告，最终返回非零退出码阻塞 MR/PR
 # ==============================================================================
 
-# ---- macOS bash 3.2 兼容：自动用 Homebrew 的 bash 5 重新执行 ----
-if [[ -n "${BASH_VERSINFO:-}" && "${BASH_VERSINFO[0]}" -lt 4 ]]; then
-  for _cs_candidate in /opt/homebrew/bin/bash /usr/local/bin/bash /opt/local/bin/bash; do
-    if [[ -x "$_cs_candidate" ]]; then
-      exec "$_cs_candidate" "$0" "$@"
-    fi
-  done
-  echo "[ERROR] 需要 bash 4+（当前 ${BASH_VERSION:-3.2} 过旧）。请先运行: brew install bash" >&2
-  exit 2
-fi
-
 set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKER_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -134,27 +123,27 @@ echo ""
 printf "%-30s %-10s %-10s %-10s\n" "检查项" "结果" "严重度" "问题数"
 printf "%.0s-" {1..60}; echo ""
 
-for key in "${!CHECK_RESULTS[@]}"; do
-  if [[ "$key" == *_status ]]; then
-    name="${key%_status}"
-    s="${CHECK_RESULTS[${name}_status]}"
-    sev="${CHECK_RESULTS[${name}_severity]:-none}"
-    cnt="${CHECK_RESULTS[${name}_count]:-0}"
-    case "$s" in
-      passed)  color=$GREEN  ;;
-      failed)  color=$RED    ;;
-      skipped) color=$YELLOW ;;
-      *)       color=$NC     ;;
-    esac
-    printf "%b%-30s %-10s %-10s %-10s%b\n" "$color" "$name" "$s" "$sev" "$cnt" "$NC"
-  fi
+_i=0
+while [[ $_i -lt ${#R_NAME[@]} ]]; do
+  name="${R_NAME[$_i]}"
+  s="${R_STATUS[$_i]}"
+  sev="${R_SEVERITY[$_i]:-none}"
+  cnt="${R_COUNT[$_i]:-0}"
+  case "$s" in
+    passed)  color=$GREEN  ;;
+    failed)  color=$RED    ;;
+    skipped) color=$YELLOW ;;
+    *)       color=$NC     ;;
+  esac
+  printf "%b%-30s %-10s %-10s %-10s%b\n" "$color" "$name" "$s" "$sev" "$cnt" "$NC"
+  _i=$((_i + 1))
 done
 
 echo ""
-echo -e "📊 通过: ${GREEN}${CHECK_COUNTS['passed']}${NC}  |  " \
-        "失败: ${RED}${CHECK_COUNTS['failed']}${NC}  |  " \
-        "跳过: ${YELLOW}${CHECK_COUNTS['skipped']}${NC}  |  " \
-        "🔥Critical=${CHECK_COUNTS['critical']} ⚠️ High=${CHECK_COUNTS['high']} 🔔Medium=${CHECK_COUNTS['medium']}"
+echo -e "📊 通过: ${GREEN}${CNT_passed}${NC}  |  " \
+        "失败: ${RED}${CNT_failed}${NC}  |  " \
+        "跳过: ${YELLOW}${CNT_skipped}${NC}  |  " \
+        "🔥Critical=${CNT_critical} ⚠️ High=${CNT_high} 🔔Medium=${CNT_medium}"
 echo "⏱️  总耗时: ${DURATION} 秒"
 echo "📁 报告目录: ${REPORT_DIR}"
 
@@ -184,7 +173,7 @@ fi
 # -------------------- 严格模式 --------------------
 if $STRICT_MODE && [[ $EXIT_CODE -eq 0 ]]; then
   # 即便 passed，但 medium 及以上累计超过阈值也阻塞
-  if [[ $((CHECK_COUNTS['medium'] + CHECK_COUNTS['high'] + CHECK_COUNTS['critical'])) -gt 0 ]]; then
+  if [[ $((CNT_medium + CNT_high + CNT_critical)) -gt 0 ]]; then
     log_warn "--strict 模式开启：存在 medium 以上问题，阻塞 MR/PR"
     EXIT_CODE=1
   fi

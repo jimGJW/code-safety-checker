@@ -1,0 +1,35 @@
+{
+  "_comment": "批量检查的仓库列表。由 scripts/check-repos.sh 读取，逐个 clone + 全量检查 + 生成报告。把要检查的 GitHub 仓库地址加到下方 repos 数组即可。",
+  "_fields": {
+    "url":    "必填，GitHub 仓库地址（HTTPS 或 SSH 均可）",
+    "name":   "可选，自定义报告目录名；留空则从 URL 自动解析",
+    "branch": "可选，指定分支；留空用默认分支",
+    "depth":  "可选，clone 深度，1=浅克隆（默认），0=全量历史",
+    "strict": "可选，true=medium 及以上问题视为失败；默认 false",
+    "only":   "可选，只执行指定检查，逗号分隔: secret,dep,frontend,backend,iac,license",
+    "skip":   "可选，跳过指定检查，逗号分隔",
+    "enabled": "可选，false 则跳过该仓库；默认 true"
+  },
+  "repos": [
+    {
+      "name": "code-safety-checker-self",
+      "url": "https://github.com/jimGJW/code-safety-checker.git",
+      "branch": "",
+      "depth": 1,
+      "strict": false,
+      "only": "",
+      "skip": "",
+      "enabled": true
+    },
+    {
+      "name": "Hello-World-example",
+      "url": "https://github.com/octocat/Hello-World.git",
+      "branch": "",
+      "depth": 1,
+      "strict": false,
+      "only": "",
+      "skip": "",
+      "enabled": false
+    }
+  ]
+}

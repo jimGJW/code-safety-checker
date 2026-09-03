@@ -17,49 +17,43 @@ export NC='\033[0m' # No Color
 
 # -------------------- 全局变量 --------------------
 export CHECKER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export REPORT_DIR="${CHECKER_ROOT}/reports"
+# 允许外部覆盖 REPORT_DIR（供 check-remote.sh 为每个被检查仓库生成独立报告目录）
+export REPORT_DIR="${REPORT_DIR:-${CHECKER_ROOT}/reports}"
 export LOG_FILE="${REPORT_DIR}/checker.log"
 export EXIT_CODE=0
-declare -A CHECK_RESULTS
-declare -A CHECK_COUNTS=(
-  ["total"]=0
-  ["passed"]=0
-  ["failed"]=0
-  ["skipped"]=0
-  ["critical"]=0
-  ["high"]=0
-  ["medium"]=0
-  ["low"]=0
-)
+# bash 3.2 无关联数组：用独立计数器 + 并行索引数组存结果（macOS 兼容）
+CNT_total=0; CNT_passed=0; CNT_failed=0; CNT_skipped=0
+CNT_critical=0; CNT_high=0; CNT_medium=0; CNT_low=0
+declare -a R_NAME R_STATUS R_SEVERITY R_COUNT R_MESSAGE
 
 # -------------------- 日志函数 --------------------
 
 log_info() {
-  echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${LOG_FILE}"
+  echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${LOG_FILE}" >&2
 }
 
 log_warn() {
-  echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${LOG_FILE}"
+  echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${LOG_FILE}" >&2
 }
 
 log_error() {
-  echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${LOG_FILE}"
+  echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${LOG_FILE}" >&2
 }
 
 log_debug() {
   if [[ "${DEBUG:-false}" == "true" ]]; then
-    echo -e "${BLUE}[DEBUG]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${LOG_FILE}"
+    echo -e "${BLUE}[DEBUG]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${LOG_FILE}" >&2
   fi
 }
 
 log_step() {
-  echo -e "\n${CYAN}========================================${NC}" | tee -a "${LOG_FILE}"
-  echo -e "${CYAN} 🔍 $*${NC}" | tee -a "${LOG_FILE}"
-  echo -e "${CYAN}========================================${NC}" | tee -a "${LOG_FILE}"
+  echo -e "\n${CYAN}========================================${NC}" | tee -a "${LOG_FILE}" >&2
+  echo -e "${CYAN} 🔍 $*${NC}" | tee -a "${LOG_FILE}" >&2
+  echo -e "${CYAN}========================================${NC}" | tee -a "${LOG_FILE}" >&2
 }
 
 log_section() {
-  echo -e "\n${PURPLE}>>> $*${NC}" | tee -a "${LOG_FILE}"
+  echo -e "\n${PURPLE}>>> $*${NC}" | tee -a "${LOG_FILE}" >&2
 }
 
 # -------------------- 结果记录函数 --------------------
@@ -71,25 +65,33 @@ record_result() {
   local count="${4:-0}"
   local message="${5:-}"
 
-  CHECK_COUNTS["total"]=$((CHECK_COUNTS["total"] + 1))
-  CHECK_RESULTS["${check_name}_status"]="$status"
-  CHECK_RESULTS["${check_name}_severity"]="$severity"
-  CHECK_RESULTS["${check_name}_count"]="$count"
-  CHECK_RESULTS["${check_name}_message"]="$message"
+  local idx=${#R_NAME[@]}
+  R_NAME[idx]="$check_name"
+  R_STATUS[idx]="$status"
+  R_SEVERITY[idx]="$severity"
+  R_COUNT[idx]="$count"
+  R_MESSAGE[idx]="$message"
+
+  CNT_total=$((CNT_total + 1))
 
   case "$status" in
     passed)
-      CHECK_COUNTS["passed"]=$((CHECK_COUNTS["passed"] + 1))
+      CNT_passed=$((CNT_passed + 1))
       log_info "✅ ${check_name}: PASSED ${message:+- $message}"
       ;;
     failed)
-      CHECK_COUNTS["failed"]=$((CHECK_COUNTS["failed"] + 1))
-      [[ -n "$severity" && "$severity" != "none" ]] && CHECK_COUNTS["$severity"]=$((CHECK_COUNTS["$severity"] + count))
+      CNT_failed=$((CNT_failed + 1))
+      case "$severity" in
+        critical) CNT_critical=$((CNT_critical + count)) ;;
+        high)     CNT_high=$((CNT_high + count)) ;;
+        medium)   CNT_medium=$((CNT_medium + count)) ;;
+        low)      CNT_low=$((CNT_low + count)) ;;
+      esac
       log_error "❌ ${check_name}: FAILED (severity: ${severity}, issues: ${count}) ${message:+- $message}"
       EXIT_CODE=1
       ;;
     skipped)
-      CHECK_COUNTS["skipped"]=$((CHECK_COUNTS["skipped"] + 1))
+      CNT_skipped=$((CNT_skipped + 1))
       log_warn "⏭️  ${check_name}: SKIPPED ${message:+- $message}"
       ;;
   esac
@@ -99,6 +101,52 @@ record_result() {
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
+}
+
+# -------------------- PCRE grep 兼容封装 --------------------
+# macOS toybox/BSD grep 不支持 -P（PCRE），这里统一封装为 grep_p：
+#   优先 grep -P（Linux GNU grep）> ggrep -P（brew 装的 GNU grep）> pgrep.py（Python 兜底）
+# 用法: grep_p "<pattern>" [--exclude-dir=D]... [--exclude=F]... <dir|file>...
+# 输出 "file:line:content"（最多 50 行），无匹配时返回 0 且不输出。
+
+# 探测一次 grep 后端（避免每次 grep_p 调用重复探测，省去每次 ~0.3s）
+GREP_P_BIN=""
+if echo x | grep -P 'x' >/dev/null 2>&1; then
+  GREP_P_BIN="grep"
+elif command -v ggrep >/dev/null 2>&1; then
+  GREP_P_BIN="ggrep"
+fi
+
+grep_p() {
+  local pattern="$1"; shift
+  local bin="${GREP_P_BIN}"
+
+  if [[ -n "$bin" ]]; then
+    local args=() found_dir=0 a
+    for a in "$@"; do
+      case "$a" in
+        --exclude-dir=*|--exclude=*) args+=("$a") ;;
+        *) args+=("$a"); [[ -d "$a" ]] && found_dir=1 ;;
+      esac
+    done
+    local rflag=""
+    [[ $found_dir -eq 1 ]] && rflag="-r"
+    "$bin" -P -H -n -I $rflag "$pattern" "${args[@]}" 2>/dev/null | head -50 || true
+  else
+    local py
+    if command -v python3 >/dev/null 2>&1; then py="python3"; else py="python"; fi
+    "$py" "${CHECKER_ROOT}/scripts/pgrep.py" "$pattern" "$@" 2>/dev/null | head -50 || true
+  fi
+}
+
+# 批量规则扫描：一次 Python 遍历匹配所有规则，避免逐条规则启动解释器的开销。
+# 用法: grep_p_batch <rules_file> <dir|file>...   (rules_file 每行: NAME<TAB>PATTERN)
+# 输出 "NAME<TAB>file:line:content"（每条规则最多 50 行）
+grep_p_batch() {
+  local rules_file="$1"; shift
+  local py
+  if command -v python3 >/dev/null 2>&1; then py="python3"; else py="python"; fi
+  "$py" "${CHECKER_ROOT}/scripts/pgrep.py" --batch "$rules_file" "$@" 2>/dev/null || true
 }
 
 ensure_dir() {
@@ -165,32 +213,32 @@ ci_markdown_summary() {
     echo ""
     echo "| 指标 | 数量 |"
     echo "|------|------|"
-    echo "| 总检查项 | ${CHECK_COUNTS['total']} |"
-    echo "| ✅ 通过 | ${CHECK_COUNTS['passed']} |"
-    echo "| ❌ 失败 | ${CHECK_COUNTS['failed']} |"
-    echo "| ⏭️  跳过 | ${CHECK_COUNTS['skipped']} |"
-    echo "| 🔥 Critical | ${CHECK_COUNTS['critical']} |"
-    echo "| ⚠️  High | ${CHECK_COUNTS['high']} |"
-    echo "| 🔔 Medium | ${CHECK_COUNTS['medium']} |"
-    echo "| ℹ️  Low | ${CHECK_COUNTS['low']} |"
+    echo "| 总检查项 | ${CNT_total} |"
+    echo "| ✅ 通过 | ${CNT_passed} |"
+    echo "| ❌ 失败 | ${CNT_failed} |"
+    echo "| ⏭️  跳过 | ${CNT_skipped} |"
+    echo "| 🔥 Critical | ${CNT_critical} |"
+    echo "| ⚠️  High | ${CNT_high} |"
+    echo "| 🔔 Medium | ${CNT_medium} |"
+    echo "| ℹ️  Low | ${CNT_low} |"
     echo ""
     echo "## 详细结果"
     echo ""
-    for key in "${!CHECK_RESULTS[@]}"; do
-      if [[ "$key" == *_status ]]; then
-        local name="${key%_status}"
-        local s="${CHECK_RESULTS[${name}_status]}"
-        local sev="${CHECK_RESULTS[${name}_severity]}"
-        local cnt="${CHECK_RESULTS[${name}_count]}"
-        local msg="${CHECK_RESULTS[${name}_message]}"
-        local icon=""
-        case "$s" in
-          passed) icon="✅" ;;
-          failed) icon="❌" ;;
-          skipped) icon="⏭️" ;;
-        esac
-        echo "- ${icon} **${name}**: ${s} (severity: ${sev}, issues: ${cnt}) ${msg:+- ${msg}}"
-      fi
+    local i=0
+    while [[ $i -lt ${#R_NAME[@]} ]]; do
+      local name="${R_NAME[$i]}"
+      local s="${R_STATUS[$i]}"
+      local sev="${R_SEVERITY[$i]}"
+      local cnt="${R_COUNT[$i]}"
+      local msg="${R_MESSAGE[$i]}"
+      local icon=""
+      case "$s" in
+        passed) icon="✅" ;;
+        failed) icon="❌" ;;
+        skipped) icon="⏭️" ;;
+      esac
+      echo "- ${icon} **${name}**: ${s} (severity: ${sev}, issues: ${cnt}) ${msg:+- ${msg}}"
+      i=$((i + 1))
     done
   } > "$summary_file"
 }

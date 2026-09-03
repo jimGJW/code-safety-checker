@@ -10,7 +10,7 @@ TARGET_DIR   ?= $(CURDIR)
 IMAGE_NAME   ?= code-safety-checker
 IMAGE_TAG    ?= latest
 
-.PHONY: help install-tools check check-full check-fast check-secret check-dep check-frontend check-backend check-iac check-license review install-hooks docker-build docker-run docker-push github-install gitlab-install self-test clean
+.PHONY: help install-tools check check-full check-fast check-secret check-dep check-frontend check-backend check-iac check-license review install-hooks check-remote check-repos docker-build docker-run docker-push github-install gitlab-install self-test clean
 
 help: ## 显示帮助
 	@awk 'BEGIN {FS = ":.*##"; printf "\n使用: make \033[36m<命令>\033[0m [变量=值]\n\n命令:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } END { print "" }' $(MAKEFILE_LIST)
@@ -83,6 +83,17 @@ install-hooks: ## 安装「提交前安全审查」hook 到目标仓库 (TARGET_
 install-hooks-global: ## 安装到全局 git 模板（对新仓库自动生效）
 	@chmod +x $(CHECKER_ROOT)/scripts/install-git-hooks.sh
 	@$(CHECKER_ROOT)/scripts/install-git-hooks.sh --global
+
+# ---------------- 远程仓库检查 ----------------
+check-remote: ## 检查远程 GitHub 仓库 (make check-remote REPO_URL=git@...:owner/repo.git)
+	@chmod +x $(CHECKER_ROOT)/scripts/check-remote.sh
+	@$(CHECKER_ROOT)/scripts/check-remote.sh $(REPO_URL) $(if $(BRANCH),--branch $(BRANCH)) \
+		$(if $(ONLY),--only $(ONLY)) $(if $(SKIP),--skip $(SKIP)) $(if $(STRICT),--strict)
+
+check-repos: ## 批量检查 config/repos.json 中的所有仓库
+	@chmod +x $(CHECKER_ROOT)/scripts/check-repos.sh
+	@$(CHECKER_ROOT)/scripts/check-repos.sh $(if $(ONLY),--only $(ONLY)) $(if $(SKIP),--skip $(SKIP)) \
+		$(if $(STRICT),--strict) $(if $(FILTER),--filter $(FILTER))
 
 # ---------------- Docker ----------------
 docker-build: ## 构建 Docker 镜像

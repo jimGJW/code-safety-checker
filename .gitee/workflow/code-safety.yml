@@ -1,0 +1,185 @@
+# ==============================================================================
+# Gitee Go 流水线模板 — 复制到业务仓库 .workflow/code-safety.yml 即生效
+# 作用: 合并请求（PR）/ push 到主分支时，自动跑 code-safety-checker
+#       并把检查报告评论到 PR；失败则流水线失败，配合 Gitee 的
+#       「合并请求必须通过流水线」选项可真正阻塞合并。
+#
+# 部署步骤（业务仓库第一次接入时做一次）：
+#   1) 在 Gitee 创建私人令牌: https://gitee.com/profile/personal_access_tokens
+#      权限打勾: projects、pull_requests、notes、user_info
+#   2) 业务仓库 → 管理 → 流水线 → 流水线变量 → 新增：
+#        name:  GITEE_TOKEN
+#        value: <上一步生成的令牌，完整字符串>
+#   3) 业务仓库 → 管理 → 流水线 → 开启 Gitee Go（若尚未开启）
+#   4) 业务仓库 → 设置 → 合并请求设置 →
+#        勾选「合并请求必须通过流水线才能合并」
+#
+# 参数调整（在下面 env 区域改）:
+#   CHECKER_REPO:   code-safety-checker 仓库地址（HTTPS 公开可拉取即可）
+#   CHECKER_REF:    拉取哪个分支 / tag
+#   STRICT:         true=medium 及以上问题也失败
+#   ONLY / SKIP:    只跑 / 跳过指定检查，逗号分隔
+# ==============================================================================
+
+name: Code Safety Check
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  # 代码安全检查器仓库（公开只读即可）；国内 Gitee Runner 推荐填 Gitee 镜像地址
+  CHECKER_REPO: https://gitee.com/jim_gjw/code-safety-checker.git
+  # 没有 Gitee 镜像时回退到 GitHub（国内网络可能慢/超时）：
+  # CHECKER_REPO: https://github.com/jimGJW/code-safety-checker.git
+  CHECKER_REF: main
+  STRICT: "false"
+  ONLY: ""
+  SKIP: ""
+
+stages:
+  - build
+
+jobs:
+  safety-check:
+    runs-on: ubuntu-latest
+    steps:
+      # ---- 1. 检出「业务代码」----
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          # 拉全量历史，供 gitleaks 扫描历史提交
+          fetch-depth: 0
+          submodules: false
+
+      # ---- 2. 安装系统依赖（gitleaks + jq + curl）----
+      - name: 安装依赖
+        run: |
+          echo "→ 安装基础工具"
+          sudo apt-get update -y
+          sudo apt-get install -y curl jq tar ca-certificates
+
+          echo "→ 安装 gitleaks（扫描敏感信息历史）"
+          VER=$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest \
+            | jq -r '.tag_name' 2>/dev/null || echo "v8.18.2")
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/${VER}/gitleaks_${VER#v}_linux_x64.tar.gz" \
+            -o /tmp/gitleaks.tgz || {
+              # GitHub 网络失败时的兜底版本
+              curl -fsSL "https://gitee.com/mirrors/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz" \
+                -o /tmp/gitleaks.tgz
+            }
+          sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks
+          gitleaks version || true
+
+      # ---- 3. 拉取检查器脚本 ----
+      - name: 拉取 code-safety-checker
+        run: |
+          echo "→ clone ${CHECKER_REPO}@${CHECKER_REF} 到 .code-safety-checker"
+          git clone --depth 1 --branch "${CHECKER_REF}" "${CHECKER_REPO}" .code-safety-checker \
+            || git clone "${CHECKER_REPO}" .code-safety-checker
+          chmod +x .code-safety-checker/scripts/*.sh
+          ls .code-safety-checker/scripts/
+
+      # ---- 4. 运行前先给 PR commit 打 pending 状态（仅 PR 事件）----
+      - name: 标记 PR pending 状态
+        if: ${{ always() }}
+        run: |
+          if [[ -n "${GITEE_PRS_NUMBER:-}" || -n "${GITEE_PR_NUMBER:-}" ]]; then
+            SHA="${GITEE_PRS_HEAD_SHA:-${GITEE_PUSH_AFTER:-$(git rev-parse HEAD)}}"
+            REPORT_DIR="$PWD/.code-safety-checker/reports" \
+            GITEE_TOKEN="${GITEE_TOKEN}" \
+              bash .code-safety-checker/scripts/gitee-comment.sh commit-state "$SHA" pending "🔒 代码安全检查运行中..." || true
+          fi
+        continue-on-error: true
+
+      # ---- 5. 全量安全与可靠性检查（核心步骤）----
+      - name: 执行代码安全检查
+        id: check
+        run: |
+          CHECKER="$PWD/.code-safety-checker"
+          # 通过 env 传递 REPORT_DIR，让 utils.sh / run-checks.sh 落到独立目录
+          export REPORT_DIR="${CHECKER}/reports"
+          mkdir -p "$REPORT_DIR"
+
+          args=(--dir .)
+          [[ "${STRICT}" == "true" ]] && args+=(--strict)
+          [[ -n "${ONLY}" ]] && args+=(--only "${ONLY}")
+          [[ -n "${SKIP}" ]] && args+=(--skip "${SKIP}")
+
+          echo "→ 运行: bash ${CHECKER}/scripts/run-checks.sh ${args[*]}"
+          set +e
+          bash "${CHECKER}/scripts/run-checks.sh" "${args[@]}" 2>&1 | tee "${REPORT_DIR}/run-output.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "→ 检查器退出码=${rc}"
+          echo "rc=${rc}" >> "$GITEE_OUTPUT" 2>/dev/null || true
+          # 让 Gitee Go 的 job 最终以检查结果状态结束（非 0 失败）
+          exit $rc
+
+      # ---- 6. 把报告发到 PR 评论（仅 PR 事件）----
+      - name: 评论检查报告到 PR
+        if: ${{ always() }}
+        run: |
+          PR_NUM="${GITEE_PRS_NUMBER:-${GITEE_PR_NUMBER:-}}"
+          if [[ -z "$PR_NUM" ]]; then echo "非 PR 事件，跳过评论"; exit 0; fi
+
+          SUMMARY=".code-safety-checker/reports/ci-summary.md"
+          LOG=".code-safety-checker/reports/run-output.log"
+          TMP_BODY="/tmp/gitee-comment.md"
+
+          {
+            echo "## 🔒 代码安全与可靠性检查"
+            echo
+            if [[ -f "$SUMMARY" ]]; then
+              cat "$SUMMARY"
+            else
+              echo "⚠️ 未生成 ci-summary.md，请查看流水线日志 / Artifacts。"
+            fi
+            echo
+            echo "<details><summary>点击展开运行日志</summary>"
+            echo
+            echo '```'
+            # 去除 ANSI 颜色码
+            [[ -f "$LOG" ]] && sed -E 's/\x1b\[[0-9;]*m//g' "$LOG" | tail -120
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            # 拼接 Artifacts / 运行记录链接（Gitee Go 的 run 链接需要用户在页面打开）
+            echo "> 提示：完整日志与各检查项原始产物可在流水线 Artifacts 中下载。"
+          } > "$TMP_BODY"
+
+          GITEE_TOKEN="${GITEE_TOKEN}" \
+            bash .code-safety-checker/scripts/gitee-comment.sh comment-pr "$PR_NUM" "$TMP_BODY" \
+            || echo "⚠️ 评论失败（通常是 GITEE_TOKEN 未配置或权限不足）"
+        continue-on-error: true
+
+      # ---- 7. 成功/失败状态写回 PR commit（仅 PR 事件）----
+      - name: 标记 PR 最终状态
+        if: ${{ always() }}
+        run: |
+          PR_NUM="${GITEE_PRS_NUMBER:-${GITEE_PR_NUMBER:-}}"
+          if [[ -z "$PR_NUM" ]]; then echo "非 PR 事件，跳过状态"; exit 0; fi
+          SHA="${GITEE_PRS_HEAD_SHA:-${GITEE_PUSH_AFTER:-$(git rev-parse HEAD)}}"
+          if [[ "${JOB_STATUS:-success}" == "success" ]] || [[ "${GITEE_JOB_STATUS}" == "success" ]]; then
+            ST=success; MSG="✅ 代码安全检查通过"
+          else
+            ST=failure; MSG="❌ 代码安全检查未通过"
+          fi
+          REPORT_DIR="$PWD/.code-safety-checker/reports" \
+          GITEE_TOKEN="${GITEE_TOKEN}" \
+            bash .code-safety-checker/scripts/gitee-comment.sh commit-state "$SHA" "$ST" "$MSG" || true
+        continue-on-error: true
+
+      # ---- 8. 上传报告 Artifacts ----
+      - name: 上传检查报告
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v2
+        with:
+          name: code-safety-reports
+          path: |
+            .code-safety-checker/reports/**
+          if-no-files-found: ignore
+          retention-days: 14

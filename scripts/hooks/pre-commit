@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# pre-commit hook（shim）— 调用同目录下的 review.sh 做暂存区快速安全审查
+#
+# 说明：
+#   - 由 install-git-hooks.sh 安装到 <仓库>/.git/hooks/pre-commit
+#   - SourceTree / 命令行 git / IDE 等所有 git 客户端提交时都会自动触发
+#   - 只扫描本次暂存(staged)的文件，秒级完成，命中高危密钥则阻止提交
+#   - 跳过方式：git commit --no-verify  或  SKIP_SAFETY=1 git commit
+# ==============================================================================
+
+if [[ "${SKIP_SAFETY:-}" == "1" || "${SKIP_SAFETY:-}" == "true" ]]; then
+  echo "[代码安全] SKIP_SAFETY=1，已跳过 pre-commit 审查"
+  exit 0
+fi
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [[ -x "$HOOK_DIR/review.sh" ]]; then
+  exec "$HOOK_DIR/review.sh" --staged
+else
+  echo "[代码安全] 未找到 review.sh（$HOOK_DIR/review.sh），跳过审查"
+  echo "  请重新运行安装脚本: ./scripts/install-git-hooks.sh"
+  exit 0
+fi

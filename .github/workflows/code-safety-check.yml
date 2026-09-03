@@ -1,0 +1,142 @@
+# ==============================================================================
+# Code Safety Check — 可复用工作流（GitHub Actions）
+#
+# 两种用法：
+#   1) 作为「可复用工作流」被业务仓库调用（推荐）：
+#        business-repo/.github/workflows/safety.yml:
+#          on: { pull_request: {}, push: { branches: [main, master] } }
+#          jobs:
+#            safety:
+#              uses: <你的组织>/code-safety-checker/.github/workflows/code-safety-check.yml@main
+#              secrets: inherit
+#
+#   2) 直接放在业务仓库 .github/workflows/ 下（内嵌方式，需先 make github-install）
+#
+# 效果：PR 打开/更新时自动全量检查；失败则 PR 显示 ❌，配合 Branch Protection
+#       的「Require status checks」即可真正阻塞 merge。
+# ==============================================================================
+
+name: Code Safety Check
+
+on:
+  workflow_call:
+    inputs:
+      strict:
+        description: "严格模式：medium 及以上问题也阻塞合并"
+        type: boolean
+        default: true
+      only:
+        description: "仅运行指定检查（逗号分隔）：secret,dep,frontend,backend,iac,license"
+        type: string
+        default: ""
+      skip:
+        description: "跳过指定检查（逗号分隔）"
+        type: string
+        default: ""
+  # 检查器仓库自身收到 PR / push 时也运行（自检）
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  group: code-safety-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  safety-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      # ---- 1. 检出「业务代码」（被调用时是调用方仓库，自检时是 checker 自身）----
+      - name: Checkout 目标代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # 拉全量历史，供 gitleaks 扫描历史提交
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      # ---- 2. 检出「检查器脚本」到独立目录 ----
+      - name: Checkout 检查器脚本
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.action_repository || github.repository }}
+          ref: ${{ github.action_ref || github.ref }}
+          path: .code-safety-checker
+
+      - name: 赋予脚本执行权限
+        run: chmod +x .code-safety-checker/scripts/*.sh
+
+      # ---- 3. 快速敏感信息扫描（diff 模式，秒级，先给个预警）----
+      - name: 快速敏感信息扫描（Diff 模式）
+        run: |
+          BASE="origin/${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}"
+          .code-safety-checker/scripts/review.sh --diff "$BASE" || true
+
+      # ---- 4. 判断是否跳过（打标签 skip-safety-check 可临时跳过）----
+      - name: 检查跳过标签
+        id: gate
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            LABELS="${{ toJSON(github.event.pull_request.labels.*.name) }}"
+            if echo "$LABELS" | grep -q "skip-safety-check"; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- 5. 全量安全与可靠性检查（权威门禁）----
+      - name: 全量安全与可靠性检查
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          SCAN_DIR: "."
+        run: |
+          args=(--dir .)
+          [[ "${{ inputs.strict }}" == "true" ]] && args+=(--strict)
+          [[ -n "${{ inputs.only }}" ]] && args+=(--only "${{ inputs.only }}")
+          [[ -n "${{ inputs.skip }}" ]] && args+=(--skip "${{ inputs.skip }}")
+          .code-safety-checker/scripts/run-checks.sh "${args[@]}"
+
+      - name: 跳过检查（已打 skip 标签）
+        if: steps.gate.outputs.skip == 'true'
+        run: echo "⚠️ 已打 skip-safety-check 标签，跳过全量检查"
+
+      # ---- 6. 上传报告（Artifacts，供下载排查）----
+      - name: 上传检查报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-safety-reports
+          path: |
+            .code-safety-checker/reports/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ---- 7. 自动评论到 PR ----
+      - name: 评论检查结果到 PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summaryPath = '.code-safety-checker/reports/ci-summary.md';
+            let body = '## 🔒 代码安全与可靠性检查\n\n';
+            if (fs.existsSync(summaryPath)) {
+              body += fs.readFileSync(summaryPath, 'utf8');
+            } else {
+              body += '⚠️ 未生成摘要文件，请查看流水线日志或下载 Artifacts。\n';
+            }
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            body += `\n\n> 📎 详细报告见流水线 Artifacts：[查看运行](${runUrl})\n`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

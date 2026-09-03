@@ -1,0 +1,117 @@
+{
+  "version": "1.0.0",
+  "project": "code-safety-checker",
+  "global": {
+    "fail_on_severity": "medium",
+    "output_format": "both",
+    "report_dir": "reports",
+    "timeout_seconds": 1800
+  },
+  "checks": {
+    "secret_scan": {
+      "enabled": true,
+      "tools": ["gitleaks", "trufflehog"],
+      "fail_on_high": true,
+      "fail_on_medium": true,
+      "custom_patterns": "config/secret-patterns.json"
+    },
+    "dependency_vulnerability": {
+      "enabled": true,
+      "tools": {
+        "frontend": ["npm-audit", "yarn-audit", "snyk"],
+        "backend": ["npm-audit", "pip-audit", "go-vulncheck", "snyk", "mvn-dependency-check"]
+      },
+      "fail_on_cvss": 7.0,
+      "allowlist": []
+    },
+    "frontend": {
+      "enabled": "auto",
+      "static_analysis": ["eslint", "semgrep"],
+      "security_rules": [
+        "no-eval",
+        "no-implied-eval",
+        "no-new-func",
+        "no-script-url",
+        "xss",
+        "cors",
+        "csrf",
+        "sql-injection",
+        "command-injection",
+        "path-traversal",
+        "hardcoded-secrets"
+      ],
+      "quality_rules": {
+        "max_complexity": 20,
+        "max_lines_per_file": 500,
+        "max_function_lines": 80,
+        "test_coverage_threshold": 60
+      }
+    },
+    "backend": {
+      "enabled": "auto",
+      "static_analysis": {
+        "nodejs": ["eslint", "semgrep"],
+        "python": ["bandit", "semgrep"],
+        "go": ["gosec", "semgrep"],
+        "java": ["spotbugs", "semgrep"],
+        "ruby": ["brakeman", "semgrep"]
+      },
+      "security_rules": [
+        "sql-injection",
+        "command-injection",
+        "path-traversal",
+        "ssrf",
+        "xxe",
+        "deserialization",
+        "auth-bypass",
+        "sensitive-data-exposure",
+        "hardcoded-secrets",
+        "insecure-crypto",
+        "open-redirect"
+      ],
+      "reliability_rules": {
+        "null_pointer_check": true,
+        "resource_leak": true,
+        "error_handling": true,
+        "input_validation": true,
+        "timeout_config": true
+      }
+    },
+    "iac_scan": {
+      "enabled": "auto",
+      "tools": ["checkov", "tfsec"],
+      "scan_dirs": ["terraform", "k8s", "docker", "helm"]
+    },
+    "container_scan": {
+      "enabled": "auto",
+      "tools": ["trivy", "dockle"],
+      "dockerfile_paths": ["Dockerfile", "**/Dockerfile"]
+    },
+    "license_check": {
+      "enabled": true,
+      "allowlist": [
+        "MIT",
+        "Apache-2.0",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "ISC",
+        "Python-2.0",
+        "LGPL-2.1",
+        "LGPL-3.0",
+        "MPL-2.0"
+      ],
+      "blocklist": [
+        "GPL-2.0",
+        "GPL-3.0",
+        "AGPL-3.0",
+        "SSPL"
+      ]
+    }
+  },
+  "notifications": {
+    "enabled": false,
+    "slack_webhook": "",
+    "teams_webhook": "",
+    "email": []
+  }
+}

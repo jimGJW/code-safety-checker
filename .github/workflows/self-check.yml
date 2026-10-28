@@ -1,0 +1,40 @@
+# ==============================================================================
+# self-check — 检查器仓库「自身」的 CI
+#
+# 这个文件才是唯一带 push / pull_request 触发器的一层。
+# 它只做一件事：调用 code-safety-check.yml。
+#
+# 为什么不直接让 code-safety-check.yml 自己监听 push？
+#   因为那样它会同时存在于两个角色里：顶层工作流 + 被调用工作流，
+#   两次运行会争抢同一个 concurrency group，GitHub 判定死锁并取消其中一条。
+#   报错形如：
+#     Canceling since a deadlock was detected for concurrency group:
+#     'code-safety-Code Safety Check-refs/heads/main' between a top level
+#     workflow and 'safety'
+# ==============================================================================
+
+name: self-check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+# concurrency 只定义在「顶层调用方」这一层，避免死锁
+concurrency:
+  group: self-check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  safety:
+    uses: ./.github/workflows/code-safety-check.yml
+    with:
+      strict: true
+      skip: iac          # 自检仓库没有 Dockerfile / K8s 清单，跳过 IaC

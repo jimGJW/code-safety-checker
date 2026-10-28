@@ -167,27 +167,48 @@ git remote add origin git@github.com:your-org/code-safety-checker.git
 git push -u origin main
 ```
 
-#### Step 2. 在每个业务仓库的 `.github/workflows/` 下创建工作流
+#### Step 2. 在每个业务仓库的 `.github/workflows/` 下创建【调用方】工作流
 
-直接复制本仓库的 `.github/workflows/code-safety-check.yml`，或者在业务仓库顶部写：
+一条命令搞定（推荐）：
+
+```bash
+cd /path/to/code-safety-checker
+make github-install CHECKER_ORG=your-org TARGET_DIR=/path/to/business-repo
+```
+
+或者手写（**注意：业务仓库里只需要这一个文件**）：
 
 ```yaml
-# business-repo/.github/workflows/code-safety.yml
-name: Call Code Safety Checker
+# business-repo/.github/workflows/safety.yml
+name: safety
+
 on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
     branches: [main, master]
 
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  # ⚠️ concurrency 只写在「顶层调用方」这一层
+  group: safety-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  call-safety-check:
+  safety:
     uses: your-org/code-safety-checker/.github/workflows/code-safety-check.yml@main
-    # 如果 checker 是私有仓库，需要 secrets 传入 PAT
-    secrets: inherit
+    with:
+      strict: true
+    secrets: inherit        # checker 为私有仓库时需要
 ```
 
-> 如果想用更简单的"内嵌副本"方式：直接执行本仓库的 `make github-install TARGET_DIR=/path/to/business-repo`。
+> ⚠️ **不要**把 `.github/workflows/code-safety-check.yml` 直接复制到业务仓库后再自己加 `push` 触发器 —— 那会让同一个文件既是「顶层工作流」又是「被调用工作流」，触发 GitHub 的并发死锁（详见下方 FAQ）。
+>
+> 若确实要内嵌副本，用 `make github-install-embedded CHECKER_ORG=your-org TARGET_DIR=...`（会自动保证可复用文件只保留 `workflow_call`）。
 
 #### Step 3. 设置为 Required Check（重要！才能真正阻塞 PR）
 
@@ -431,6 +452,34 @@ stage('Safety Check') {
 
 **Q5: 如何和内部 IM 打通（飞书/钉钉/企微/Slack）？**
 - 在 `scripts/utils.sh:ci_markdown_summary()` 扩展通知逻辑；或在 CI 的最后一步 `curl` 到相应 webhook，传入 `reports/ci-summary.md` 内容即可。
+
+**Q6: GitHub Actions 报 `Canceling since a deadlock was detected for concurrency group ... between a top level workflow and 'safety'`，每次提交都出现？**
+
+这是 **同一个工作流既被 `push` 触发（顶层运行）、又被 `uses:` 调用（嵌套运行）**，两次运行抢同一个 `concurrency.group`，GitHub 判定死锁并取消其中一条。
+
+修复三步：
+
+1. **可复用文件只保留 `workflow_call`** —— 删掉 `code-safety-check.yml` 里的 `pull_request` / `push` 触发器，**并移除它的 `concurrency:` 段**：
+   ```yaml
+   on:
+     workflow_call:
+     workflow_dispatch:   # 可选，用于手动跑
+   # ❌ 不要 pull_request / push
+   # ❌ 不要 concurrency
+   ```
+2. **`concurrency` 只写在调用方**（`safety.yml`）这一层：
+   ```yaml
+   concurrency:
+     group: safety-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref }}
+     cancel-in-progress: true
+   ```
+3. **清理业务仓库里的重复文件**：如果 `.github/workflows/` 下同时存在 `code-safety-check.yml`（还带 push 触发器）和 `safety.yml`，删掉或改名前者：
+   ```bash
+   git rm .github/workflows/code-safety-check.yml
+   ```
+
+> 本仓库已按此规范修好：`.github/workflows/code-safety-check.yml` 只做可复用；
+> 检查器自身的 CI 走 `.github/workflows/self-check.yml`；业务仓库模板见 `templates/github/safety.yml`。
 
 ---
 

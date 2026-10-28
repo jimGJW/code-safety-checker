@@ -1,0 +1,49 @@
+# ==============================================================================
+# 业务仓库调用 Code Safety Checker 的标准模板
+#
+# 用法（二选一）：
+#   A) 远程引用（推荐）：
+#        uses: your-org/code-safety-checker/.github/workflows/code-safety-check.yml@main
+#   B) 内嵌副本（代码已 copy 进本仓库）：
+#        uses: ./.github/workflows/code-safety-check.yml
+#      注意：内嵌时，code-safety-check.yml 里【必须】只有 workflow_call，
+#            否则会出现 "deadlock was detected ... between a top level workflow
+#            and 'safety'" 死锁报错。
+#
+# 关键约定：
+#   ✅ concurrency 只写在这一层（顶层调用方）
+#   ❌ 被调用的 code-safety-check.yml 不要再写 concurrency
+# ==============================================================================
+
+name: safety
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  # 用 PR head ref，让「同一分支连续 push」只保留最新一次，避免排队
+  group: safety-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  safety:
+    # A) 远程引用：把 your-org 换成你的组织/用户名
+    uses: your-org/code-safety-checker/.github/workflows/code-safety-check.yml@main
+
+    # B) 内嵌副本：解开下面这行、注释掉上面那行
+    # uses: ./.github/workflows/code-safety-check.yml
+
+    with:
+      strict: true          # medium 及以上也阻塞合并
+      # only: "secret,dep"  # 只想跑部分检查时填（逗号分隔）
+      # skip: "iac,license" # 想跳过部分检查时填（逗号分隔）
+    secrets: inherit        # checker 为私有仓库时需要

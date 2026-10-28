@@ -18,6 +18,16 @@
 
 name: Code Safety Check
 
+# ⚠️ 重要：本文件是「可复用工作流」，只保留 workflow_call。
+# 千万不要再加 push / pull_request 触发器！
+# 原因：一旦本文件既能被 push 触发（顶层运行）又能被业务仓库的 safety.yml 通过
+#       `uses:` 调用（嵌套运行），两次运行会落进同一个 concurrency group，
+#       GitHub 会判定为死锁并报：
+#       "Canceling since a deadlock was detected for concurrency group:
+#        'code-safety-Code Safety Check-refs/heads/main' between a top level
+#        workflow and 'safety'"
+#       表现为「每次提交都会有一条运行被自动取消」。
+# 检查器仓库自身要自检，请用 .github/workflows/self-check.yml（它来调用本文件）。
 on:
   workflow_call:
     inputs:
@@ -33,19 +43,28 @@ on:
         description: "跳过指定检查（逗号分隔）"
         type: string
         default: ""
-  # 检查器仓库自身收到 PR / push 时也运行（自检）
-  pull_request:
-  push:
-    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: "严格模式"
+        type: boolean
+        default: true
+      only:
+        description: "仅运行指定检查（逗号分隔）"
+        type: string
+        default: ""
+      skip:
+        description: "跳过指定检查（逗号分隔）"
+        type: string
+        default: ""
 
 permissions:
   contents: read
   pull-requests: write
   checks: write
 
-concurrency:
-  group: code-safety-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# concurrency 由「调用方」负责（见 templates/github/caller-safety.yml）。
+# 被调用方可不设 concurrency，避免与调用方的组冲突再次引发死锁。
 
 jobs:
   safety-check:

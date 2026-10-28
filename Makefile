@@ -9,8 +9,9 @@ REPORT_DIR   ?= $(CHECKER_ROOT)/reports
 TARGET_DIR   ?= $(CURDIR)
 IMAGE_NAME   ?= code-safety-checker
 IMAGE_TAG    ?= latest
+CHECKER_ORG  ?= your-org
 
-.PHONY: help install-tools check check-full check-fast check-secret check-dep check-frontend check-backend check-iac check-license review install-hooks check-remote check-repos docker-build docker-run docker-push github-install gitee-install gitlab-install self-test clean
+.PHONY: help install-tools check check-full check-fast check-secret check-dep check-frontend check-backend check-iac check-license review install-hooks check-remote check-repos docker-build docker-run docker-push github-install github-install-embedded gitee-install gitlab-install self-test clean
 
 help: ## 显示帮助
 	@awk 'BEGIN {FS = ":.*##"; printf "\n使用: make \033[36m<命令>\033[0m [变量=值]\n\n命令:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } END { print "" }' $(MAKEFILE_LIST)
@@ -112,11 +113,28 @@ docker-push: ## 推送镜像到镜像仓库
 	docker push $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
 
 # ---------------- CI 安装辅助 ----------------
-github-install: ## 一键复制 GitHub Actions 到当前目标仓库
+# 注意：GitHub Actions 里 concurrency 只能定义在「顶层调用方」。
+# 因此业务仓库只安装 safety.yml（调用方），可复用文件由远程引用。
+github-install: ## 安装「调用方」工作流 safety.yml 到业务仓库 (CHECKER_ORG=xxx TARGET_DIR=xxx)
 	@[ -d "$(TARGET_DIR)/.github/workflows" ] || mkdir -p "$(TARGET_DIR)/.github/workflows"
-	cp .github/workflows/code-safety-check.yml "$(TARGET_DIR)/.github/workflows/"
-	@echo "✅ 已复制到 $(TARGET_DIR)/.github/workflows/code-safety-check.yml"
-	@echo "请编辑此文件顶部的 CHECKER_REPO / CHECKER_REF 变量"
+	@if [ -f "$(TARGET_DIR)/.github/workflows/code-safety-check.yml" ]; then \
+	  mv "$(TARGET_DIR)/.github/workflows/code-safety-check.yml" \
+	     "$(TARGET_DIR)/.github/workflows/code-safety-check.yml.bak" ; \
+	  echo "⚠️  检测到旧版 code-safety-check.yml（含 push 触发器，会引发死锁），已备份为 .bak" ; \
+	fi
+	@sed 's|your-org|$(CHECKER_ORG)|g' templates/github/safety.yml > "$(TARGET_DIR)/.github/workflows/safety.yml"
+	@echo "✅ 已生成 $(TARGET_DIR)/.github/workflows/safety.yml"
+	@echo "   引用: $(CHECKER_ORG)/code-safety-checker/.github/workflows/code-safety-check.yml@main"
+	@echo "   如需改成内嵌副本，用: make github-install-embedded TARGET_DIR=..."
+
+github-install-embedded: ## 内嵌模式: 同时复制可复用文件 + 调用方（两者都去掉多余触发器）
+	@[ -d "$(TARGET_DIR)/.github/workflows" ] || mkdir -p "$(TARGET_DIR)/.github/workflows"
+	@cp .github/workflows/code-safety-check.yml "$(TARGET_DIR)/.github/workflows/"
+	@sed 's|your-org|$(CHECKER_ORG)|g' templates/github/safety.yml > "$(TARGET_DIR)/.github/workflows/safety.yml"
+	@sed -i.bak 's|^\( *\)uses: .*code-safety-check.yml@main|\1uses: ./.github/workflows/code-safety-check.yml|' \
+	  "$(TARGET_DIR)/.github/workflows/safety.yml"
+	@rm -f "$(TARGET_DIR)/.github/workflows/safety.yml.bak"
+	@echo "✅ 内嵌模式已安装: code-safety-check.yml (workflow_call only) + safety.yml (调用方)"
 
 gitee-install: ## 一键复制 Gitee Go 流水线到当前目标仓库
 	@[ -d "$(TARGET_DIR)/.workflow" ] || mkdir -p "$(TARGET_DIR)/.workflow"
